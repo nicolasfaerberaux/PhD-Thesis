@@ -1,0 +1,435 @@
+import numpy as np
+import time, os, sys
+from urllib.parse import urlparse
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from cellpose import utils, io
+import cv2 as cv
+from cellpose import models, io
+from cellpose import plot
+from tqdm import tqdm
+import math
+from PIL import Image, ImageDraw, ImageFont
+import PIL.Image
+# Maximale Bildgröße für PIL.Image Paket erweitern
+PIL.Image.MAX_IMAGE_PIXELS = 186613760
+# Eine Bildsegmentierung mit cellpose durchführen, 1 = Ja, 0 = Nein
+create_binary_mask_with_cellpose = 0
+# Kanal für die Segmentierung aussuchen _440 oder _490
+channel_for_segmentation = '_490' # _440 or _490
+# Schätzung für Zelldurchmesser angeben, adhärente HeLa Zellen mit 10x Objektiv: 38.79, None für automatisierte Schätzung
+cell_pose_diameter = 38.79
+# Mittleren GP-Wert für Zellen berechnen, erstellt außerdem Datei mit allen Pixelinformationen, 1 = Ja, 0 = Nein
+calculate_pixel_data_and_mean_values = 0
+# dritten Kanal für Stofftransportmessungen auswerten, 1 = Ja, 0 = Nein
+with_dye_uptake = 0
+# Maximale Zellfläche in Pixeln angeben, standard: 5000 (10x Objektiv), zu große Werte erzeugen große Pixeldatendateien
+cell_max_size = 5000
+# Minimale Zellfläche in Pixeln angeben
+cell_min_size = 1
+# Konstanten Hintergrundwert abziehen, 1 = Ja, 0 = Nein
+subtract_background = 0
+background_value = 0
+# Die Zahl nächster Nachbarn bestimmen, 1 = Ja, 0 = Nein
+calculate_neighbours = 1
+# Schwellewert für Nachbar-Klassifizierung angeben
+nearest_neighbours_thres = 50 #def:50
+# Farbbild aus 440/490/Stofftransport Bilder mit Segmentierung erzeugen, 1 = Ja, 0 = Nein
+create_color_picture_with_outlines = 1
+# Farbbild aus 440/490/Stofftransport Bilder mit Segmentierung und Nachbaranzahl erzeugen, 1 = Ja, 0 = Nein
+draw_number_of_neighbours_in_color_picture = 1
+# Ziwschen innerer und äußerer Zellmembran differenzieren, 1 = Ja, 0 = Nein
+calculate_inner_outer_mean_gp = 0
+# Schwellwert ab welchem Abstand vom Zellzentrum die äußere Membran beginnt
+distance_from_centroid_trsh = 15 #px
+# Stofftransport vs. GP und GP-Histogramm plotten, 1 = Ja, 0 = Nein
+plot_data = 0
+hist_range =(-0.4, 0.2)
+# mehrere Datensätze zu Mittelwert, Stabwa und SE zusammenfassen, 1 = Ja, 0 = Nein
+reduce_datasets = 0
+# Die Zusammenfassungsgraphen speichern, 1 = Ja, 0 = Nein
+save_plots = 0
+# Welche Datensätze zusammenfassen?
+samples_to_reduce = ['Experiment_1', 'Experiment_2', 'Experiment_3']
+# Experimentpfad angeben
+# Im angegebenen Ordner müssen folgende Ordner vorhanden sein:
+#"image_data": Hier müssen die auszuwertenden Bilder liegen. Beispiel 440/490-Messung mit Stofftransport im TexasRed-Kanal(TR)
+#Die 440/490 wurden in ImageJ um einen konstanten Hintergrundintensitätswert korrigiert, Das TR-Bild wurde mit 100 Pixel Rolling Ball bearbeitet
+#Experiment_1_440-bgsb-constvalue.tif, Experiment_1_490-bgsb-constvalue.tif, Experiment_1_TR-bgsb100px.tif
+#"cellpose_masks": Hier wird das segmentierte Bild als .png und als .npy gespeichert, Farbbilder und Farbbilder mit nächsten Nachbarn landen auch hier
+#"mean_data": Hier werden die GP und Transport-Mittelwerte, die Radiale Auswertung und die inne vs. außen Analyse gespeichert. 
+#"pixel_data" .npy Dateien mit Zellpixeldaten
+#"centroid_masks": Segmentierte Bilder mit Distanz zum Mitellpunkt- nud Schwellwertdarstellung
+#"plot_data": I(GP) und GP-Histogramme der zusammengefassten Datensätze
+exp_path = "C:\\Users\\...\\Stofftransport_vs_Lipidordnung\\"
+# Einzeln auszuwertende Experimente angeben
+samples = ['Experiment_1', 'Experiment_2', 'Experiment_3']
+
+# Funktion zum Zusammenfassen eines Datensatzes (z.B. I(GP)) aus N Punkten zu Wurzel(N) Werten
+def reduce_gp_int_data(gp_data, intensity_data):
+    number_of_cells = len(gp_data)
+    number_of_data_points = int(np.sqrt(number_of_cells))
+    data = np.zeros(number_of_cells, dtype = np.dtype([('gp', float), ('intensity', float)]))
+    data['gp'] = gp_data
+    data['intensity'] = intensity_data
+    data = np.sort(data, axis = 0, order = 'gp')
+    result = np.zeros(number_of_data_points, dtype = np.dtype([('gp', float), ('intensity', float), ('stdev', float), ('se', float)]))
+    for i in range(0, number_of_data_points):
+        result['gp'][i] = np.mean(data['gp'][i*number_of_data_points:(i+1)*number_of_data_points])
+        result['intensity'][i] = np.mean(data['intensity'][i*number_of_data_points:(i+1)*number_of_data_points])
+        result['stdev'][i] = np.std(data['intensity'][i*number_of_data_points:(i+1)*number_of_data_points])
+        result['se'][i] = result['stdev'][i] / np.sqrt(number_of_data_points)
+    return result
+
+# Funktion zur Berechnung eins GP-Histogramms mit Bin-Breite 0,01
+def calculate_gp_histogram(gp_data):
+    hist, bin_edges = np.histogram(gp_data, bins = 200, range=(-1,1))
+    bin_centers = np.zeros([len(bin_edges)-1])
+    for i in range(len(bin_centers)):
+        bin_centers[i] = bin_edges[i] + (bin_edges[i+1]-bin_edges[i])/2
+    return [bin_centers, hist]
+
+#Iterieren über Experiment_1, Experiment_2, ...
+for sample in samples:
+    image_data_path = exp_path +'image_data\\'+ sample
+    mask_data_path = exp_path+'cellpose_masks\\'+sample + channel_for_segmentation
+    mean_data_path = exp_path+'mean_data\\'
+    pixel_data_path = exp_path+'pixel_data\\'
+    centroid_masks_path = exp_path+'centroid_masks\\'
+    plot_data_path = exp_path+'plot_data\\'
+    
+    #Bildsegmetierung, wenn gewünscht
+    if create_binary_mask_with_cellpose == 1:
+        # Grafikkarte Nutzen und Zellmembranen detektieren, Zur Detektion von Zellkernen: model_type='nuclei'
+        model = models.Cellpose(gpu=True, model_type='cyto')
+        img = io.imread(image_data_path + channel_for_segmentation + '-bgsb-constvalue.tif')
+        masks, flows, styles, diams = model.eval(img, diameter=cell_pose_diameter, channels=[0,0])
+        io.masks_flows_to_seg(img, masks, flows, diams, mask_data_path, channels=[0,0])
+        io.save_to_png(img, masks, flows, mask_data_path)
+        
+    #GP- und Transportmittelwerte berechnen, wenn gewünscht
+    if calculate_pixel_data_and_mean_values == 1:
+        # cellpose Segmentierungsdaten laden
+        dat = np.load(mask_data_path+'_seg.npy', allow_pickle=True).item()
+        outlines = dat['outlines']
+        # Cellpose Segmentierungsmaske laden
+        mask = dat['masks']
+        # Die Pixelwerte der Maske entsprechen der Zellnummer
+        number_of_cells = mask.max()
+        # Bilder für GP-Berechnung laden
+        image_440 = io.imread(image_data_path+'_440-bgsb-constvalue.tif')
+        image_490 = io.imread(image_data_path+'_490-bgsb-constvalue.tif')
+        # Hintergundkorrektur, falls gewünscht
+        if subtract_background == 1:
+            image_440 = image_440 - background_value
+            image_490 = image_490 - background_value
+        # Transportauswertung, falls gewünscht    
+        if with_dye_uptake == 1:
+            image_uptake = io.imread(image_data_path+'_TR-bgsb100px.tif')
+        # Arrays für Zelldaten initialisieren
+        cell_pixels = np.zeros([number_of_cells, cell_max_size, 5], dtype = np.float32)# all cells with more area are neglected
+        cell_areas = np.zeros(number_of_cells, dtype='uint16')
+        cell_image_indices = np.zeros(number_of_cells, dtype='uint16')
+        outside_detection_limit_indices = []
+        # Über alle Bildpixel iterieren und für jeden Pixel GP und Transport bestimmen
+        for y in tqdm(range(mask.shape[1]), desc ="identify cell pixel coordinates, gp and dye uptake"):
+                for x in range(mask.shape[0]):
+                    if mask[x][y] != 0:
+                        cell_index = mask[x][y]-1
+                        cell_image_indices[cell_index] = mask[x][y]
+                        if not cell_index in outside_detection_limit_indices:
+                            cell_pixels[cell_index][cell_areas[cell_index]][0] = x
+                            cell_pixels[cell_index][cell_areas[cell_index]][1] = y
+                            if image_440[x,y] != image_490[x,y]:
+                                cell_pixels[cell_index][cell_areas[cell_index]][2] = ((float(image_440[x,y])-float(image_490[x,y])) / (float(image_440[x,y])+float(image_490[x,y])))
+                            if with_dye_uptake == 1:
+                                cell_pixels[cell_index][cell_areas[cell_index]][3] = image_uptake[x,y]
+                            cell_areas[cell_index] = cell_areas[cell_index] + 1
+                            if cell_areas[cell_index] >= cell_max_size:
+                                outside_detection_limit_indices.append(cell_index)
+        # Zu große und zu kleine Zellen löschen
+        for i in tqdm(range(number_of_cells), desc ="delete to small detections"):
+            if cell_areas[i] < cell_min_size:
+                outside_detection_limit_indices.append(i)
+        cell_pixels = np.delete(cell_pixels, outside_detection_limit_indices, axis=0)
+        cell_areas = np.delete(cell_areas, outside_detection_limit_indices, axis=0)
+        cell_image_indices = np.delete(cell_image_indices, outside_detection_limit_indices, axis=0)
+        number_of_cells = len(cell_pixels[:])
+        # Zellmittelpunkte, GP-MIttelwerte und mittlere Transportintensität berechnen
+        cell_centroids_x = np.zeros(number_of_cells)
+        cell_centroids_y = np.zeros(number_of_cells)
+        cell_mean_gp = np.zeros(number_of_cells)
+        cell_mean_dye_uptake = np.zeros(number_of_cells)
+        for i in tqdm(range(number_of_cells), desc ="calculate cell centroids, mean gp and mean dye uptake"):
+            x_sum = 0
+            y_sum = 0
+            gp_sum = 0
+            dye_uptake_sum = 0
+            for j in range(cell_areas[i]):
+                x_sum = x_sum + cell_pixels[i][j][0]
+                y_sum = y_sum + cell_pixels[i][j][1]
+                gp_sum = gp_sum + cell_pixels[i][j][2]
+                dye_uptake_sum = dye_uptake_sum + cell_pixels[i][j][3]
+            cell_centroids_x[i] = x_sum / cell_areas[i]
+            cell_centroids_y[i] = y_sum / cell_areas[i]
+            cell_mean_gp[i] = gp_sum / cell_areas[i]
+            cell_mean_dye_uptake[i] = dye_uptake_sum / cell_areas[i]
+        #Mittelwerte speichern
+        np.savetxt((mean_data_path+sample+"_cell_mean_values.txt"),np.transpose([cell_image_indices, cell_centroids_x, cell_centroids_y, cell_areas, cell_mean_gp, cell_mean_dye_uptake]), header ="Image_index X[px] Y[px] Area[px^2] Mean_GP Uptake_intensity", comments='')
+        #Für jeden Pixel die Distanz zum Zellzentrum berechnen
+        for i in tqdm(range(number_of_cells), desc ="calculate pixel distances to centroids"):
+            for j in range(cell_areas[i]):
+                cell_pixels[i][j][4] = int(np.sqrt((cell_pixels[i][j][0]-cell_centroids_x[i])**2+(cell_pixels[i][j][1]-cell_centroids_y[i])**2)) # hier könnte man die auflösung noch höher drehen: einfach *10 und dann einheit als zehntel px
+        #Pixeldaten speichern
+        np.save(pixel_data_path+sample+"_pixel_data", cell_pixels)
+        #Bild berechnen, in dem jeder Pixelwert dem Abstand vom Zellzentrum entspricht
+        centroid_mask = np.zeros_like((mask), dtype=np.uint8)
+        for i in tqdm(range(number_of_cells), desc ="create mask with centroids"):
+            #if cell_mean_gp[i] < 0: ### nur zum finden von speziellen zellen! danach if entfernen
+            for j in range(cell_areas[i]):
+                x = int(cell_pixels[i][j][0])
+                y = int(cell_pixels[i][j][1])
+                centroid_mask[x, y] = cell_pixels[i][j][4]
+            centroid_x = int(cell_centroids_x[i])
+            centroid_y = int(cell_centroids_y[i])
+            centroid_mask[centroid_x, centroid_y] = 255
+            centroid_mask[centroid_x+1, centroid_y] = 255
+            centroid_mask[centroid_x-1, centroid_y] = 255
+            centroid_mask[centroid_x, centroid_y+1] = 255
+            centroid_mask[centroid_x, centroid_y-1] = 255
+        #Bild speichern, in dem jeder Pixelwert dem Abstand vom Zellzentrum entspricht
+        cv.imwrite(centroid_masks_path + sample + '_centroid_mask.tif', centroid_mask)
+        #Radiale GP-Auswertung
+        distance_mean_gp = np.zeros(255)
+        pixel_sum = np.zeros(255)
+        for i in tqdm(range(number_of_cells), desc ="calculate mean_gp vs distance to centroid"):
+            for j in range(cell_areas[i]):
+                distance = int(cell_pixels[i][j][4])
+                distance_mean_gp[distance] = distance_mean_gp[distance] + cell_pixels[i][j][2]
+                pixel_sum[distance] = pixel_sum[distance] + 1
+        for i in range(255):
+            if pixel_sum[i] != 0:
+                distance_mean_gp[i] = distance_mean_gp[i] / pixel_sum[i]
+        #Speichern der radialen GP-Auswertung
+        np.savetxt((mean_data_path+sample+"_distance_mean_gp.txt"),np.transpose([range(255), pixel_sum, distance_mean_gp]), header ="Distance[px] Number_of_pixels Mean_GP", comments='')
+    
+    #Nächste Nachbarn berechnen, falls gewünscht
+    if calculate_neighbours == 1:
+        mean_data = np.transpose(np.loadtxt(mean_data_path+sample+"_cell_mean_values.txt", skiprows=1))
+        cell_centroids_x = mean_data[1]
+        cell_centroids_y = mean_data[2]
+        number_of_cells = len(cell_centroids_x)
+        data = np.zeros([7, number_of_cells])
+        data[:][0:6] = mean_data[:][0:6]
+        #Distanz jeder Zelle zu allen anderen Zellen berechnen und auf Schwellwert überprüfen 
+        for i in tqdm(range(number_of_cells-1), desc='calculate nearest_neighbours'):
+            cell_a = (cell_centroids_x[i],cell_centroids_y[i])
+            for j in range(i+1,number_of_cells):
+                cell_b = (cell_centroids_x[j],cell_centroids_y[j])
+                if(math.dist(cell_a, cell_b) < nearest_neighbours_thres):    
+                    data[6][i] += 1
+                    data[6][j] += 1 
+        np.savetxt((mean_data_path+sample+"_cell_mean_values.txt"),np.transpose(data), header ="Image_index X[px] Y[px] Area[px^2] Mean_GP Uptake_intensity nearest_neigbours", comments='')
+    
+    #Farbbild aller analysierten Kanäle mit Segmentierungsrand erzeugen
+    if create_color_picture_with_outlines == 1:
+        dat = np.load(mask_data_path+'_seg.npy', allow_pickle=True).item()
+        outlines = dat['outlines']
+        mean_data = np.transpose(np.loadtxt(mean_data_path+sample+"_cell_mean_values.txt", dtype='uint16', skiprows=1))
+        cell_indices = mean_data[0]            
+        image_440 = io.imread(image_data_path+'_440-bgsb-constvalue.tif')
+        image_440_8bit = image_440 - image_440.min()
+        image_440_8bit = image_440_8bit / image_440_8bit.max() * 255
+        image_440_8bit = np.uint8(image_440_8bit)
+        image_490 = io.imread(image_data_path+'_490-bgsb-constvalue.tif')
+        image_490_8bit = image_490 - image_490.min()
+        image_490_8bit = image_490_8bit / image_490_8bit.max() * 255
+        image_490_8bit = np.uint8(image_490_8bit)
+        if with_dye_uptake == 1:
+            image_uptake = io.imread(image_data_path+'_TR-bgsb100px.tif')
+            image_uptake_8bit = image_uptake - image_uptake.min()
+            image_uptake_8bit = image_uptake_8bit / image_uptake_8bit.max() * 255
+            image_uptake_8bit = np.uint8(image_uptake_8bit)
+        rgb = np.zeros([image_440.shape[0], image_440.shape[1], 3], dtype=np.uint8)
+        for y in tqdm(range(rgb.shape[1]), desc ="create color image"):
+                for x in range(rgb.shape[0]):
+                   rgb[x][y][0] = image_440_8bit[x][y]
+                   rgb[x][y][1] = image_490_8bit[x][y]
+                   if with_dye_uptake == 1:
+                       rgb[x][y][2] = image_uptake_8bit[x][y]
+        for y in tqdm(range(rgb.shape[1]), desc ="draw outlines in colorimage"):
+                for x in range(rgb.shape[0]):
+                    if outlines[x][y] != 0:
+                        cell_index = outlines[x][y]-1
+                        if cell_index in cell_indices:
+                            rgb[x][y][1] = 255
+                            rgb[x][y][2] = 255
+        cv.imwrite(mask_data_path+'_color_with_outlines.jpg', rgb)
+        
+    # Zahl nächster Nachbarn in jeder Zelle auf vorher erzeugtem Farbbild notieren
+    if draw_number_of_neighbours_in_color_picture == 1:
+        font = ImageFont.truetype("arial.ttf", 25)
+        mean_data = np.transpose(np.loadtxt(mean_data_path+sample+"_cell_mean_values.txt", dtype='uint16', skiprows=1))
+        cell_centroids_x = mean_data[1]
+        cell_centroids_y = mean_data[2]
+        number_of_neighbours = mean_data[6]
+        number_of_cells = len(cell_centroids_x)
+        img = Image.open(mask_data_path+"_color_with_outlines.jpg")
+        draw = ImageDraw.Draw(img)
+        for i in range(number_of_cells):
+            draw.text((cell_centroids_y[i]-5,cell_centroids_x[i]-15), str(number_of_neighbours[i]), font=font, fill=(255,255,255,255))
+        img.save(mask_data_path+"_nn_trsh-"+ str(nearest_neighbours_thres) +"px_color_with_outlines.jpg")
+    
+    #Innere Zellembran vs. äußere Zellmembran GP-Analyse
+    if calculate_inner_outer_mean_gp == 1:
+        dat = np.load(mask_data_path +'_seg.npy', allow_pickle=True).item()
+        mask = dat['masks']
+        cell_pixels = np.load(pixel_data_path+sample+"_pixel_data.npy")
+        number_of_cells = len(cell_pixels[:])
+        mean_data = np.transpose(np.loadtxt(mean_data_path+sample+"_cell_mean_values.txt", dtype='uint16', skiprows=1))
+        cell_centroids_x = mean_data[1]
+        cell_centroids_y = mean_data[2]
+        cell_areas = mean_data[3]
+        cell_mean_inner_gp = np.zeros(number_of_cells)
+        cell_mean_outer_gp = np.zeros(number_of_cells)
+        inner_outer_mask = np.zeros_like(mask)
+        for i in tqdm(range(number_of_cells), desc ="calculate inner and outer mean gp"):
+            inner_gp_sum = 0
+            outer_gp_sum = 0
+            inner_area = 0
+            outer__area = 0
+            centroid_x = int(cell_centroids_x[i])
+            centroid_y = int(cell_centroids_y[i])
+            for j in range(cell_areas[i]):
+                x = int(cell_pixels[i][j][0])
+                y = int(cell_pixels[i][j][1])
+                if cell_pixels[i][j][4] < distance_from_centroid_trsh:
+                    inner_gp_sum = inner_gp_sum + cell_pixels[i][j][2]
+                    inner_area = inner_area + 1
+                    inner_outer_mask[x,y] = 127
+                else:
+                    outer_gp_sum = outer_gp_sum + cell_pixels[i][j][2]
+                    outer__area = outer__area + 1
+                    inner_outer_mask[x,y] = 255
+            inner_outer_mask[centroid_x, centroid_y] = 255
+            inner_outer_mask[centroid_x+1, centroid_y] = 255
+            inner_outer_mask[centroid_x-1, centroid_y] = 255
+            inner_outer_mask[centroid_x, centroid_y+1] = 255
+            inner_outer_mask[centroid_x, centroid_y-1] = 255
+            cell_mean_inner_gp[i] = inner_gp_sum / inner_area
+            if outer__area == 0:
+                cell_mean_outer_gp[i] = np.nan
+            else:
+                cell_mean_outer_gp[i] = outer_gp_sum / outer__area
+        cv.imwrite(centroid_masks_path + sample + '_distance_threshold_mask.tif', inner_outer_mask)
+        np.savetxt((mean_data_path+sample+"_inner_and_outer_mean_gp.txt"),np.transpose([cell_mean_inner_gp, cell_mean_outer_gp]), header ="Inner_GP Outer_GP", comments='')
+    
+    # I(GP) und GP-Histogramme plotten
+    if plot_data == 1:
+        mean_data = np.transpose(np.loadtxt(mean_data_path+sample+"_cell_mean_values.txt", skiprows=1))
+        number_of_cells = len(mean_data[4])
+        data = np.zeros(number_of_cells, dtype = np.dtype([('gp', float), ('intensity', float)]))
+        data['gp'] = mean_data[4]
+        data['intensity'] = mean_data[5]
+        data = np.sort(data, axis = 0, order = 'gp')
+        number_of_data_points = int(np.sqrt(number_of_cells))
+        mean_GP_data = np.zeros(number_of_data_points)
+        mean_intensity_data = np.zeros(number_of_data_points)
+        for i in range(0, number_of_data_points):
+            for j in range(0, number_of_data_points):
+                mean_GP_data[i] = mean_GP_data[i] + data['gp'][i*number_of_data_points+j]
+                mean_intensity_data[i] = mean_intensity_data[i] + data ['intensity'][i*number_of_data_points+j]
+            mean_GP_data[i] = mean_GP_data[i] / number_of_data_points
+            mean_intensity_data[i] = mean_intensity_data[i] / number_of_data_points
+        hist, bin_edges = np.histogram(data['gp'], bins = int((hist_range[1]-hist_range[0])/0.01), range=hist_range)
+        bin_centers = np.zeros([len(bin_edges)-1])
+        for i in range(len(bin_centers)):
+            bin_centers[i] = bin_edges[i] + (bin_edges[i+1]-bin_edges[i])/2
+        plt.plot(bin_centers, hist, 'bo-')
+        plt.twinx()
+        plt.plot(mean_GP_data, mean_intensity_data, 'ro')
+        plt.show()
+        np.savetxt((plot_data_path+sample+"_gp_histogram.txt"),np.transpose([bin_centers, hist]), header ="Bin_center Counts", comments='')
+        np.savetxt((plot_data_path+sample+"_reduced_gp_and_dye_uptake.txt"),np.transpose([mean_GP_data, mean_intensity_data]), header ="Mean_gp Mean_uptake_intensity", comments='')
+
+#Mehrere Datensätze reduzieren, falls gewünscht
+if reduce_datasets == 1:
+    reduced_data_path = exp_path+'reduced_data\\'
+    image_plot_path = exp_path+'plot_images\\'
+    filename = ''
+    int_header = ''
+    for sample in samples_to_reduce:
+        filename = filename + sample + '_'
+        int_header = int_header + sample + '_GP ' + sample + '_intensity '
+    int_header = int_header + 'reduced_GP ' + 'reduced_intensity'
+    gp_header = ''
+    for sample in samples_to_reduce:
+        gp_header = gp_header + sample + '_GP ' + sample + '_counts '
+    gp_header = gp_header + 'reduced_GP ' + 'reduced_counts'
+    gp_dataset =[]
+    uptake_dataset = []
+    mean_experiment = []
+    number_of_cells_in_experiment = []
+    number_of_experiments = len(samples_to_reduce)
+    total_mean = 0
+    total_number_of_cells = 0
+    for i in range(number_of_experiments):
+        gp_dataset.append(np.transpose(np.loadtxt(mean_data_path+samples_to_reduce[i]+"_cell_mean_values.txt", skiprows=1))[4])
+        uptake_dataset.append(np.transpose(np.loadtxt(mean_data_path+samples_to_reduce[i]+"_cell_mean_values.txt", skiprows=1))[5]) 
+    #Aus jedem einzelnen Datensatz sollen gleich viele Zellen in die gesamte Auswertung eingehen
+    #Finde also das Experiment mit der kleinsten Zellzahl
+    min_cell_number = 65536
+    for i in range(number_of_experiments):
+        if len(gp_dataset[i]) < min_cell_number:
+            min_cell_number = len(gp_dataset[i])
+    #Sowohl Datensätze einzeln mit calculate_gp_histogram und reduce_gp_int_data auswerten als auch alle zusammen
+    all_GP = []
+    all_uptake = []        
+    for i in range(number_of_experiments):
+        all_GP = np.concatenate((all_GP, gp_dataset[i][0:min_cell_number]))
+        all_uptake = np.concatenate((all_uptake, uptake_dataset[i][0:min_cell_number]))
+    int_result = np.zeros([number_of_experiments*2+4, int(np.sqrt(min_cell_number*number_of_experiments))])
+    gp_result = np.zeros([number_of_experiments*2+2, 200])
+    for i in range(number_of_experiments):
+        x_data = reduce_gp_int_data(gp_dataset[i][0:min_cell_number], uptake_dataset[i][0:min_cell_number])['gp']
+        y_data = reduce_gp_int_data(gp_dataset[i][0:min_cell_number], uptake_dataset[i][0:min_cell_number])['intensity']
+        plt.plot(x_data, y_data, 'o', mfc='none',label=samples_to_reduce[i])
+        int_result[i*2][0:int(np.sqrt(min_cell_number))] = x_data
+        int_result[i*2+1][0:int(np.sqrt(min_cell_number))] = y_data
+        gp_result[i*2] = calculate_gp_histogram(gp_dataset[i][0:min_cell_number])[0]
+        gp_result[i*2+1] = calculate_gp_histogram(gp_dataset[i][0:min_cell_number])[1]
+    gp_result[number_of_experiments*2+2-2] = calculate_gp_histogram(all_GP)[0]
+    gp_result[number_of_experiments*2+2-1] = calculate_gp_histogram(all_GP)[1]
+    x_data = reduce_gp_int_data(all_GP, all_uptake)['gp']
+    y_data = reduce_gp_int_data(all_GP, all_uptake)['intensity']
+    y_stdev = reduce_gp_int_data(all_GP, all_uptake)['stdev']
+    y_se = reduce_gp_int_data(all_GP, all_uptake)['se']
+    int_result[number_of_experiments*2+4-4] = x_data
+    int_result[number_of_experiments*2+4-3] = y_data
+    int_result[number_of_experiments*2+4-2] = y_stdev
+    int_result[number_of_experiments*2+4-1] = y_se
+    plt.plot(x_data, y_data, 'k-', label='reduced')
+    plt.fill_between(x_data, y_data - y_stdev, y_data + y_stdev, color='gray', alpha=0.2)
+    plt.fill_between(x_data, y_data - y_se, y_data + y_se, color='gray', alpha=0.4)
+    plt.legend()
+    plt.xlabel('GP')
+    plt.ylabel('Uptake intensity [a.u]')
+    plt.title('Dye uptake')
+    plt.grid()
+    if save_plots == 1:
+        plt.savefig(image_plot_path+filename+"_uptake.png")
+    plt.show()
+    for i in range(number_of_experiments):
+        plt.plot(gp_result[i*2], gp_result[i*2+1], 'o', mfc='none', label=samples_to_reduce[i])
+    plt.plot(gp_result[number_of_experiments*2+2-2], gp_result[number_of_experiments*2+2-1]/3, 'k-', label='reduced')
+    plt.xlim(hist_range[0], hist_range[1]);
+    plt.legend()
+    plt.xlabel('GP')
+    plt.ylabel('Counts')
+    plt.title('GP-Histogram')
+    plt.grid()
+    if save_plots == 1:
+        plt.savefig(image_plot_path+filename+"_histogram.png")
+    plt.show()
+    np.savetxt((reduced_data_path+"reduced_intensity_"+filename+".txt"),np.transpose(int_result), header = int_header, comments='')
+    np.savetxt((reduced_data_path+"reduced_gp_"+filename+".txt"),np.transpose(gp_result), header = gp_header, comments='')
