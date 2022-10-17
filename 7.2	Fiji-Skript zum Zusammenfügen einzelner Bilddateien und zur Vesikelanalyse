@@ -1,0 +1,183 @@
+ dir = getDirectory("Experiment auswählen");
+ images = getFileList(dir);
+ x = 10;
+ y = 12;
+ number_of_channels = 1;
+ channel = newArray("490", "440", "TexasRed", "Cy5", "BrightField");
+ measuremnt_channel = newArray("Fitc", "TexasRed", "Cy5", "DAPI");
+ number_of_scans = 1;
+ maskpath = "path";
+
+  radius_binarize = 50;
+  radius_measure = 50;
+  min = 50;
+  max = 500;
+  roundmin = 0;
+  roundmax = 1.0;
+  factor = 1.704;
+  thrshvalue = 0;
+  number_of_measurements = 1;
+
+  Dialog.create("Awesome Data analysis program");
+  Dialog.addString("X-Abmessungen des scans:" ,x);
+  Dialog.addString("Y-Abmessungen des scans:" ,y);
+  Dialog.addNumber("Anzahl der Kanäle:", number_of_channels);
+  Dialog.addString("Anzahl der scans:" ,number_of_scans);
+  Dialog.show();
+  x = Dialog.getString();
+  y = Dialog.getString();
+  number_of_channels = Dialog.getNumber();
+  number_of_scans = Dialog.getString();
+
+   Dialog.create("Awesome Data analysis program");
+   for (i = 0; i < number_of_channels; i++) {
+   	Dialog.addString("name of channel "+toString(i+1)+":" ,channel[i]);
+   }
+   Dialog.show();
+   for (i = 0; i < number_of_channels; i++) {
+   	channel[i] = Dialog.getString();
+   }
+
+  Dialog.create("Awesome Data analysis program");
+  Dialog.addCheckbox("Stitch pictures", true);
+  Dialog.addCheckbox("Set scale", false);
+  Dialog.addMessage("2.5x: 2.398 µm/px\n4x:    1.704 µm/px\n5x:    1.248 µm/px\n10x:  0.627 µm/px\n20x:  0.309 µm/px\n40x:  0.155 µm/px")
+  Dialog.addString("Scale factor [µm/px]:" ,factor);
+  Dialog.addCheckbox("Create stack for each channel", false);
+  Dialog.addCheckbox("Binarize stack", false);
+  Dialog.addCheckbox("Analyze particles in binarized stack and measure", false);
+  Dialog.show();
+  stitch = Dialog.getCheckbox();
+  setscale = Dialog.getCheckbox();
+  factor = Dialog.getString();
+  create_stack = Dialog.getCheckbox();
+  binarize = Dialog.getCheckbox();
+  analyze = Dialog.getCheckbox();
+
+if (binarize == true) {
+	Dialog.create("Binarization options");
+	Dialog.addChoice("binarize method:", newArray("find edges and treshold","threshold only"));
+	Dialog.addChoice("channel to binarize:", channel);
+	Dialog.show();
+	method = Dialog.getChoice();
+	channel_binarize = Dialog.getChoice();
+	if (method == "threshold only") {
+		Dialog.create("Awesome Data analysis program");
+		Dialog.addCheckbox("Subtract background before tresholding", false);
+		Dialog.addString("Rolling ball radius in px:" ,radius_binarize);
+		Dialog.show();
+		bgsb_binarize = Dialog.getCheckbox();
+		radius_binarize = Dialog.getString();
+	}
+}
+  
+if (analyze == true) {
+	Dialog.create("Particle analysis options");
+	Dialog.addString("Minimum particle size:" ,min);
+	Dialog.addString("Maximum particle size:" ,max);
+	Dialog.addString("Minimum particle roundness:" ,roundmin);
+	Dialog.addString("Maximum particle roundness:" ,roundmax);
+	Dialog.addNumber("number channels to measure afterwards:", number_of_measurements);
+	Dialog.show();
+	min = Dialog.getString();
+	max = Dialog.getString();
+	roundmin = Dialog.getString();
+	roundmax = Dialog.getString();
+	number_of_measurements = Dialog.getNumber();
+
+	Dialog.create("Measurement options");
+	for (i = 0; i < number_of_measurements; i++) {
+		Dialog.addChoice("channels to measure:", measuremnt_channel);
+	}
+	Dialog.addCheckbox("Subtract image background before measurement", true);
+	Dialog.addString("Rolling ball radius in px:" ,radius_measure);
+	Dialog.show()
+	for (i = 0; i < number_of_measurements; i++) {
+		measuremnt_channel[i] = Dialog.getChoice();
+	}
+	bgsb_measure = Dialog.getCheckbox();
+	radius_measure = Dialog.getString();
+}
+
+
+
+if (stitch == true){
+	for (i = 0; i < number_of_channels; i++) {
+		File.makeDirectory(dir+channel[i]);
+	}
+
+	for (j = 0; j < number_of_channels; j++) {
+		for (i = 0; i < number_of_scans; i++) {
+			image_name = substring(images[0], 0, 7) + "{iiiii}_"+toString(j+1)+".tif";
+			run("Grid/Collection stitching", "type=[Grid: row-by-row] order=[Left & Up] grid_size_x="+x+" grid_size_y=" + y + " tile_overlap=0 first_file_index_i="+toString(i*parseInt(x)*parseInt(y)+1)+" directory="+dir+" file_names=" + image_name + " output_textfile_name=TileConfiguration.txt fusion_method=[Linear Blending] regression_threshold=0.30 max/avg_displacement_threshold=2.50 absolute_displacement_threshold=3.50 invert_x invert_y computation_parameters=[Save computation time (but use more RAM)] image_output=[Fuse and display] use");
+			if (setscale == true) {
+				run("Set Scale...", "distance=1 known="+factor+" pixel=1 unit=µm");
+			}
+			saveAs(dir + channel[j] + "/" + toString(i) +"-"+ channel[j] + ".tif");
+			close();
+		}
+	}
+}
+
+if (create_stack == true) {
+	for (j = 0; j < number_of_channels; j++) {
+	run("Image Sequence...", "open="+dir + channel[j] + "/0-"+ channel[j] + ".tif sort");
+	saveAs(dir + channel[j] + "/"+ channel[j] + "-stack.tif");
+	close();
+	}
+}
+
+if (binarize == true) {
+	open(dir + channel_binarize + "/" + channel_binarize + "-stack.tif");
+	if (method == "find edges and treshold") {
+		run("Find Edges", "stack");
+		run("Threshold...");
+ 		waitForUser("Please adjust threshold and afterwards click OK");
+ 		Dialog.create("DAPI-Threshold value");
+ 		Dialog.addString("Which treshold value did you use?:" ,0);
+ 		Dialog.show();
+ 		thrshvalue = Dialog.getString();
+ 		run("Fill Holes", "stack");
+ 		run("Watershed", "stack");
+ 		maskpath = dir + channel_binarize + "/" + channel_binarize + "-stack-find_edges-treshold("+thrshvalue+")-fill_holes-watershed.tif";
+ 		saveAs(maskpath);
+ 		close();
+	} else {
+		if (bgsb_binarize == true) {
+			run("Subtract Background...", "rolling=" + radius_binarize + " stack");
+		}
+		run("Threshold...");
+ 		waitForUser("Please adjust threshold, apply and click OK");
+ 		Dialog.create("DAPI-Threshold value");
+ 		Dialog.addString("Which treshold value did you use?:" ,0);
+ 		Dialog.show();
+ 		thrshvalue = Dialog.getString();
+ 		run("Watershed", "stack");
+ 		if (bgsb_binarize == true) {
+ 			maskpath = dir + channel_binarize + "/" + channel_binarize + "-stack-bgsb("+radius_binarize+"px)-treshold("+thrshvalue+")-watershed.tif";
+ 			saveAs(maskpath);
+ 		} else {
+ 			maskpath = dir + channel_binarize + "/" + channel_binarize + "-stack-treshold("+thrshvalue+")-watershed.tif";
+ 			saveAs(maskpath);
+ 		}
+ 		close();
+	}
+}
+
+if (analyze == true) {
+	for (i = 0; i < number_of_measurements; i++) {
+		open(dir + measuremnt_channel[i] + "/" + measuremnt_channel[i] + "-stack.tif");
+		if (bgsb_measure == true) {
+			run("Subtract Background...", "rolling=" + radius_measure + " stack");
+		}
+		run("Set Measurements...", "mean centroid display redirect="+measuremnt_channel[i] + "-stack.tif"+" decimal=3");
+		open(maskpath);
+		run("Analyze Particles...", "size="+min+"-"+max+" circularity="+roundmin+"-"+roundmax+" exclude clear include add stack");
+		roiManager("Measure");
+ 		selectWindow("Results");
+ 		saveAs(dir + measuremnt_channel[i] + "/" + measuremnt_channel[i] + ".txt");
+ 		close("Results");
+ 		close("*");
+ 		close("ROI Manager");
+	}
+}
