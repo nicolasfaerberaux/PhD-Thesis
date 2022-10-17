@@ -1,0 +1,168 @@
+import numpy as np
+import math
+
+# Name des Ordners angeben, in welchem die mean_data Datei liegt, welcher mithilfe des Zellsegmentierungsskripts erstellt wurde
+path = "C:\\Users\\...\\mean_data\\"
+# Anzahl der Bilder, die verglichen werden sollen
+bilder = 18
+# Distanz innerhalb derer zwei Zellen als zusammengehörig definiert werden
+threshold = 20
+# Die jeweilgen Temperaturen, bei denen die Bilder aufgenommen wurden
+temperaturpunkte = [44.6, 43.3, 41.4, 39, 36.5, 34, 31.5, 28.9, 26.5, 24.1, 21.9, 19.7, 17.6, 15.7, 14, 12.4, 11, 9.7]
+# GP-Wert um UV-Belichtung korrigieren, 1 = Ja, 0 = Nein
+use_bleaching_kor = 1
+# UV-induzierte GP-Änderung pro Bild: 0.00355 
+bleaching_kor_probild = 0.00355 
+# Schmelztemperaturen mit Zweizustandsmodell berechnen, 1 = Ja, 0 = Nein
+thermodynamische_betrachtung = 1
+# Bilder-allowed_trace_cutoff = Zahl der Bilder, über die eine Zelle nachverfolgt werden muss, um in der thermodynamischen Auswertung berücksichtigt zu werden 
+allowed_trace_cutoff = 1
+# Arrays für Zellinformationen initialisieren
+cell_centroids_x =[]
+cell_centroids_y =[]
+cell_gp =[]
+steigungen=[]
+offsets=[]
+uptake=[]
+deltagp=[]
+# über alle Bilder iterieren
+for i in range(bilder):
+    # Daten aus mean_values datei laden 
+    mean_data = np.transpose(np.loadtxt(path+"Image1_"+str.zfill(str(i+1),5)+"_cell_mean_values.txt", skiprows=1))
+    # Zellpositionen extrahieren
+    cell_centroids_x.append(mean_data[1])
+    cell_centroids_y.append(mean_data[2])
+    # Zell-GP-Werte extrahieren
+    cell_gp.append(mean_data[4])
+# Arrays für Suchalgorithmus initialisieren
+# 2D-array für GP-Werte, Zeilen: Anzahl der Zellen x Spalten: Temperaturpunkte
+gparray = np.zeros([len(cell_centroids_x[0])+1,bilder]) 
+zulöschend = []
+gelöschte_zellen=0
+getracte_zellen=len(cell_centroids_x[0]) 
+#Erste Spalte von gp-array mit Temperaturen befüllen
+for i in range(bilder):
+    gparray[0][i]=temperaturpunkte[i]
+#Erste Zeile von gp-array mit GP-Werten bei erstem Temperaturpunkt füllen
+for i in range(len(cell_centroids_x[0])):
+    gparray[i+1][0]=cell_gp[0][i] 
+#Über alle Zellen i des ersten Bilds iterieren
+for i in range(len(cell_centroids_x[0])):
+    #Die Position von Zelle i wird nachfolgend mit den Positionen aller Zellen in den folgenden Bildern verglichen
+    source=i
+    #Variable, um hierher zurückzukommen, wenn keine passende Zellposition gefunden wird
+    schleife_verlassen = 0
+    #Über alle nachfolgende Bilder iterieren
+    for j in range(bilder-1):
+        #Variable, um Schleife zu verlassen, wenn keine passende Zelle gefunden wird
+        zellegefunden=0
+        #Schleife zu verlassen, wenn keine passende Zelle gefunden wurde
+        if schleife_verlassen:
+            break
+        #Über alle Zellen k in Bild j iterieren:
+        for k in range(len(cell_centroids_x[j+1])):
+            # Wenn Zelle k nicht weiter als der anfangs definierte Schwellwert von Zell i entfernt ist, werden die Zellen als zusammengehörig klassifiziert
+            if (abs(cell_centroids_x[j][source]-cell_centroids_x[j+1][k])+abs(cell_centroids_y[j][source]-cell_centroids_y[j+1][k])<threshold):
+                # Wenn die Korektur zur UV-induzierten GP-Änderung angewendet werden, soll...
+                if use_bleaching_kor==1:
+                    # k ist die neue Zelle mit der die Zellen auf den nächsten Bildern verglichen wird
+                    source=k
+                    # GP Wert der gefundenen Zelle mit UV-GP-Änderung korrigieren und in gparray speichern
+                    gparray[i+1][j+1] = cell_gp[j+1][source]-bleaching_kor_probild*(j+1)
+                    # Abbruchvariable auf nicht abbrechen setzen
+                    zellegefunden=1
+                    # Bei zusätzlicher Mesung des Stofftransports neben GP, auch die Fluoreszenzintensität von RHodB oder Slica NP speichern
+                    uptake.append(mean_data[5][source])
+                    break
+                else:
+                    # siehe vorherige Kommentare
+                    source=k
+                    gparray[i+1][j+1] = cell_gp[j+1][source]
+                    zellegefunden=1
+                    uptake.append(mean_data[5][source])
+                    break
+        # Wenn keine passende Zelle geunden wurde, Schleife verlassen und NaN in gparray speichern       
+        if zellegefunden==0:       
+            gparray[i+1][j+1] = np.nan
+            schleife_verlassen = 1
+#Alle Zellen, die nicht oft genug gefunden wurden, als zu löschen markieren            
+for i in range(len(cell_centroids_x[0])+1):
+    for j in range(bilder-allowed_trace_cutoff):
+        if  math.isnan(gparray[i][j]):
+            zulöschend.append(i)
+            gelöschte_zellen += 1
+            getracte_zellen -= 1
+            break    
+#Alle Zellen, die nicht oft genug gefunden wurden, löschen
+gparray = np.delete(gparray,zulöschend,0)    
+temperaturpunkte2 = temperaturpunkte.copy()
+temperaturpunkte2.pop()
+#Delta_GP berechnen
+for i in range(getracte_zellen):
+    gp=gparray[i+1][0]-gparray[i+1][1]
+    deltagp.append(gp)
+#Tempertaurabhängige GP-Steigung ermitteln
+for i in range(getracte_zellen):   
+    m,b = np.polyfit(temperaturpunkte,gparray[i+1], 1)
+    steigungen.append(m)
+    offsets.append(b)
+#Tempertaurabhängige GP-Steigung als Funktion der Temperatur ermitteln
+fitdata = np.zeros([getracte_zellen+1,bilder]) 
+for i in range(bilder):
+    fitdata[0][i]=temperaturpunkte[i]
+    for j in range(getracte_zellen):
+        fitdata[j+1][i] = temperaturpunkte[i]*steigungen[j]+offsets[j]
+#GP-Transformation auf Lipidordnung(Gelidität) bzw. Lipidunordnung(Fluidität)         
+gelidität = np.zeros([getracte_zellen+1,bilder]) 
+fluidität = np.zeros([getracte_zellen+1,bilder]) 
+for i in range(getracte_zellen):
+    for j in range(bilder):
+        gelidität[i+1][j]=(gparray[i+1][j]+1)/2
+        fluidität[i+1][j]=1-gelidität[i+1][j]
+        gelidität[0][j]=temperaturpunkte[j]
+        fluidität[0][j]=temperaturpunkte[j]
+#Thermodynamische Berechnungen (Zweizustandsmodell)
+if thermodynamische_betrachtung==1:
+    kelvinpunkte = np.zeros([bilder])
+    rtpunkte = np.zeros([bilder])
+    gipps = np.zeros([getracte_zellen,bilder])
+    enthalpie = []
+    entropie = []
+    schmelztemperatur = np.zeros([getracte_zellen,2])
+    #x-Achsen-Transformation
+    for i in range(bilder):    
+        kelvinpunkte[i] = temperaturpunkte[i]+273.2
+        rtpunkte[i] = 1/(kelvinpunkte[i]*8.3)
+    #Enthalpie-Berechnung
+    for i in range(getracte_zellen):
+        m,b = np.polyfit(rtpunkte,np.log(fluidität[i+1]/(1-fluidität[i+1])),1)
+        enthalpie.append(m)
+    #Entropie-Berechnung
+    for i in range(getracte_zellen):
+        m,b = np.polyfit(kelvinpunkte,np.log(fluidität[i+1]/(1-fluidität[i+1]))/rtpunkte,1)
+        entropie.append(m)
+    #Gipps-freie-Energie-Berechnung
+    for i in range(bilder): 
+        for j in range(getracte_zellen):
+            gipps[j][i]=enthalpie[j]+entropie[j]*kelvinpunkte[i]
+    #Schmelztemperatur-Berechnung
+    for i in range(getracte_zellen):
+        gippssteigung=(gipps[i][0]-gipps[i][1])/(kelvinpunkte[0]-kelvinpunkte[1])
+        gippsachsenabschnitt=gipps[i][0]-gippssteigung*kelvinpunkte[0]
+        schmelztemperatur[i][0]=-gippsachsenabschnitt/gippssteigung
+        schmelztemperatur[i][1]=schmelztemperatur[i][0]-273.2
+#Daten speichern        
+np.savetxt(path+"FitData.txt",np.transpose(fitdata))           
+np.savetxt(path+"gp-zugeordnet.txt",np.transpose(gparray))
+np.savetxt(path+"Steigungen.txt",steigungen)
+np.savetxt(path+"Offsets.txt",offsets)
+np.savetxt(path+"uptake-zugeordnet.txt",uptake)
+np.savetxt(path+"DeltaGP.txt",deltagp)
+np.savetxt(path+"Enthalpie.txt",enthalpie)
+np.savetxt(path+"Entropie.txt",entropie)
+np.savetxt(path+"Gipps.txt",np.transpose(gipps))
+np.savetxt(path+"Kelvinpunkte.txt",kelvinpunkte)
+np.savetxt(path+"RTPunkte.txt",rtpunkte)
+np.savetxt(path+"Schmelztemperatur.txt",schmelztemperatur)        
+np.savetxt(path+"Gelidität.txt",np.transpose(gelidität))
+np.savetxt(path+"Fluidität.txt",np.transpose(fluidität))
