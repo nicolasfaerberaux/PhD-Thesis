@@ -1,0 +1,191 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Apr  4 14:41:30 2020
+
+@author: Nicolas
+"""
+savedata = 0 # Sollen die Fit-Daten gespeichert werden? 1 = Ja 0 = Nein
+savegraphs = 0 # Sollen die Ergebnis-Graphen gespeichert werden? 1 = Ja 0 = Nein
+save_gp_evolution = 0 # Sollen die GP-Graphen für ein Video gespeichert werden? 1 = Ja 0 = Nein
+savefits = 0 # Sollen die Fit-Graphen für ein Video gespeichert werden? 1 = Ja 0 = Nein
+time_or_temperature = 1 # Sollen die Daten als Funktion der Zeit oder als Funktion der Temperatur geplottet werden? 1 = Temperatur 0 = Zeit
+
+sample = "spektren" # Name des Experimentordners angeben, Dateiname der Spektren in der Form: 123456sec-12,34°C-abc...xyz.txt"
+path = "C:\\Users\\nicol\\Studium\\Promotion\\nr4a\\2022.07.06_hela_nr4a_1zu50_10miocells\\" # Pfad des Experimentordners angeben
+
+# Wellenlängenbereich in nm für den spektralen Fit angeben
+min_wavelength = 380 #default:380
+max_wavelength = 670 #default:670
+
+# Wellenlängenbereich in nm für Generalized Polarization angeben
+min_blue_wavelength = 420 # 40nm bandbreite um 440 nm zentriert
+max_blue_wavelength = 460
+min_green_wavelength = 470 # 40nm bandbreite um 490 nm zentriert
+max_green_wavelength = 510
+
+#Benötigte Pakete einbinden
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from scipy.optimize import curve_fit
+import scipy.integrate as integrate
+
+dt = np.dtype([('wavelength', float), ('intensity', float)]) #Datentyp der Spektralen Daten festlegen
+
+def gel_vmin(vm): #vm in nm
+   return 1150.7+0.877*vm
+def gel_vmax(vm):
+    return -99.3+1.058*vm
+def gel_rho(vm):
+    return (vm-gel_vmin(vm))/(gel_vmax(vm)-vm)
+def gel_a(vm):
+    return vm+((gel_vmax(vm)-gel_vmin(vm))*gel_rho(vm))/(gel_rho(vm)**2-1)
+def gel_lognorm(v, im, vm):
+    return im*np.exp(-(np.log(2)/np.log(gel_rho(vm))**2)*np.log((gel_a(vm)-v)/(gel_a(vm)-vm))**2)
+
+def fluid_vmin(vm): #vm in nm
+   return -958.4+0.966*vm
+def fluid_vmax(vm):
+    return 1688.8+0.986*vm
+def fluid_rho(vm):
+    return (vm-fluid_vmin(vm))/(fluid_vmax(vm)-vm)
+def fluid_a(vm):
+    return vm+((fluid_vmax(vm)-fluid_vmin(vm))*fluid_rho(vm))/(fluid_rho(vm)**2-1)
+def fluid_lognorm(v, im, vm):
+    return im*np.exp(-(np.log(2)/np.log(fluid_rho(vm))**2)*np.log((fluid_a(vm)-v)/(fluid_a(vm)-vm))**2)
+
+def _2lognorm(v, gel_int, gel_vm, fluid_int, fluid_vm):
+    return gel_lognorm(v, gel_int, gel_vm)+fluid_lognorm(v, fluid_int, fluid_vm)
+
+
+spectrum_data = sorted(os.listdir(path+sample+"\\")) #Dateinamen der Spektren aus Experimentordner einlesen
+temperature = [float(i[10:15].replace(',','.')) for i in spectrum_data] #Temperaturen aus Dateinamen lesen, default: i[10:15]
+time = [float(i[0:6].replace(',','.')) for i in spectrum_data] #Zeiten aus Dateinamen lesen, default: i[0:6], für oceanview: i[6:11]
+
+#arrays für zu berechnende Größen initialiseren
+gp_by_intensity = np.empty(len(spectrum_data))
+gel_area = np.empty(len(spectrum_data))
+fluid_area = np.empty(len(spectrum_data))
+gp_by_fit = np.empty(len(spectrum_data))
+overall_area = np.empty(len(spectrum_data))
+
+for i in range(0,len(spectrum_data)):
+        #Spektren mit vorgegebenen Spektralbereich einlesen
+        matrix = open(path+sample+"\\"+spectrum_data[i])
+        data = np.loadtxt((line.replace(',', '.') for line in matrix), dtype = dt, skiprows = 14) 
+        data = np.delete(data, np.where(data['wavelength'] < min_wavelength))
+        data = np.delete(data, np.where(data['wavelength'] > max_wavelength))
+        
+        #GP aus Intensitätsverhältnis von Grün und Blau berechnen
+        blue_wavelengths = np.delete(data, np.where(data['wavelength'] < min_blue_wavelength))
+        blue_wavelengths = np.delete(blue_wavelengths, np.where(blue_wavelengths['wavelength'] > max_blue_wavelength))
+        blue_intensity = np.sum(blue_wavelengths['intensity'])        
+        green_wavelengths = np.delete(data, np.where(data['wavelength'] < min_green_wavelength))
+        green_wavelengths = np.delete(green_wavelengths, np.where(green_wavelengths['wavelength'] > max_green_wavelength))
+        green_intensity = np.sum(green_wavelengths['intensity'])
+        gp_by_intensity[i] = (blue_intensity-green_intensity)/(blue_intensity+green_intensity)
+        
+        #Wellenzahl in inversen cm für Fitfunktion bestimmen und Spektrum plotten
+        wavenumber = (1/(data['wavelength']))*10000000
+        plt.plot(data['wavelength'], data['intensity'], '.k')
+        
+        #Spektrum fitten, Startwerte angeben und Grenzen bestimmen
+        popt, pcov = curve_fit(_2lognorm, wavenumber, data['intensity'], p0=[30000, 22222, 8000, 20408], bounds=([0, 21276, 0, 19607], [np.inf, 23255, np.inf, 21276]))# default:p0=[10000, 22222, 100000, 20408], bounds=([0, 21276, 0, 19607], [np.inf, 23255, np.inf, 21276]) 
+        perr = np.sqrt(np.diag(pcov))
+        
+        if(savefits == 1):
+            fitdata = np.empty([5, len(data)])
+            fitdata[0] = data['wavelength']
+            fitdata[1] = data['intensity']
+            fitdata[2] = _2lognorm(wavenumber, *popt)
+            fitdata[3] = gel_lognorm(wavenumber, *popt[0:2])
+            fitdata[4] = fluid_lognorm(wavenumber, *popt[2:4])
+            if not os.path.exists(path+"spektren_fits"):
+                os.mkdir(path+"spektren_fits")
+            np.savetxt((path+"spektren_fits\\"+str(temperature[i])+".txt"), np.transpose(fitdata), header ="Wavelength Intensity Fit Blue Green", comments='')
+
+        
+        plt.plot(data['wavelength'], _2lognorm(wavenumber, *popt), 'r')
+        plt.plot(data['wavelength'], gel_lognorm(wavenumber, *popt[0:2]), 'b')
+        plt.fill_between(data['wavelength'], gel_lognorm(wavenumber, *popt[0:2]).min(), gel_lognorm(wavenumber, *popt[0:2]), facecolor="blue", alpha=0.5)
+        plt.plot(data['wavelength'], fluid_lognorm(wavenumber, *popt[2:4]), 'g')
+        plt.fill_between(data['wavelength'], fluid_lognorm(wavenumber, *popt[2:4]).min(), fluid_lognorm(wavenumber, *popt[2:4]), facecolor="green", alpha=0.5)
+        plt.grid()
+        plt.xlabel('Wavelength [nm]')
+        plt.ylabel('Intensity [counts]')
+        plt.title(spectrum_data[i])
+        if(savegraphs == 1):
+            plt.savefig(path+sample+"-"+spectrum_data[i]+".png")
+        plt.show()
+       
+
+        
+        print(popt[0], 10000000/popt[1], popt[2], 10000000/popt[3])
+        print(integrate.trapz(_2lognorm(wavenumber, *popt), x=data['wavelength']))
+
+        gel_area[i] = integrate.trapz(gel_lognorm(wavenumber, *popt[0:2]), x=data['wavelength'])    
+        fluid_area[i] = integrate.trapz(fluid_lognorm(wavenumber, *popt[2:4]), x=data['wavelength'])
+        
+        gp_by_fit[i] = (gel_area[i]-fluid_area[i])/(gel_area[i]+fluid_area[i])
+        
+        if(save_gp_evolution == 1):
+                      
+            plt.subplots_adjust(wspace=0.3,hspace=0.5)
+            fig = plt.figure(figsize=(10,5))
+            fig.text(0.35,0.74, str(round(temperature[i], 1))+ '°C', style='italic', backgroundcolor = 'w', fontsize=15)
+            
+            plt.subplot(121)
+            plt.xlim([380,670])
+            plt.xticks(range(400,651,50))
+            plt.ylim([0,21000])
+            plt.yticks(range(0,20001,4000))
+            plt.plot(data['wavelength'], data['intensity'], '.k')
+            plt.plot(data['wavelength'], _2lognorm(wavenumber, *popt), 'r')
+            plt.plot(data['wavelength'], gel_lognorm(wavenumber, *popt[0:2]), 'b')
+            plt.fill_between(data['wavelength'], gel_lognorm(wavenumber, *popt[0:2]).min(), gel_lognorm(wavenumber, *popt[0:2]), facecolor="blue", alpha=0.5)
+            plt.plot(data['wavelength'], fluid_lognorm(wavenumber, *popt[2:4]), 'g')
+            plt.fill_between(data['wavelength'], fluid_lognorm(wavenumber, *popt[2:4]).min(), fluid_lognorm(wavenumber, *popt[2:4]), facecolor="green", alpha=0.5)
+            plt.grid()
+            plt.xlabel('Wavelength [nm]')
+            plt.title('Intensity [counts]')
+
+            plt.subplot(122) 
+            plt.plot(temperature[0:i], gp_by_fit[0:i], label='by Fit')
+            plt.xlim([-45,95])
+            plt.xticks(range(-40,90,20))
+            plt.ylim([-0.7, 1.1])
+            plt.yticks([-0.5, -0.25, 0, 0.25, 0.5, 0.75, 1])
+            plt.xlabel('Temperature [°C]')
+            plt.title('Generalized polarization')
+            plt.grid()
+            
+            plt.savefig(path+"video\\"+spectrum_data[i]+".png")
+            plt.show()
+
+if(time_or_temperature == 1):
+    x_data = temperature
+    x_label = 'Temperature [°C]'
+else:
+    x_data = time
+    x_label = 'Time [s]'
+      
+
+plt.plot(x_data, gp_by_fit, label='by Fit')
+plt.xlabel(x_label)
+plt.ylabel('Generalized Polarization by Fit')
+plt.plot(x_data, gp_by_intensity, label='by intensity ratio')
+plt.legend()
+plt.title('Phase state parameters')
+plt.grid()
+plt.show()
+
+
+result = np.empty([5,len(spectrum_data)])
+result[0] = temperature
+result[1] = time
+result[2] = gp_by_fit
+result[3] = gp_by_intensity
+result[4] = overall_area
+
+if(savedata == 1):
+    np.savetxt((path+sample+"-doublelognormalfit_result.txt"), np.transpose(result), header ="Temperature Time Fit_GP Int_ratio_GP Overall_int", comments='')
